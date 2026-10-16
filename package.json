@@ -1,0 +1,72 @@
+{
+	"name": "cursor-daily-credits",
+	"displayName": "Cursor Daily Credits",
+	"description": "Shows Cursor Models and Other Models daily allowances, what you used today, a daily history graph, and the models behind that usage.",
+	"version": "1.3.7",
+	"publisher": "Teaya",
+	"icon": "icon.png",
+	"license": "MIT",
+	"engines": {
+		"vscode": "^1.85.0"
+	},
+	"categories": [
+		"Other",
+		"Visualization"
+	],
+	"keywords": [
+		"cursor",
+		"usage",
+		"credits",
+		"daily budget",
+		"quota",
+		"plans"
+	],
+	"activationEvents": [
+		"onStartupFinished"
+	],
+	"main": "./out/extension.js",
+	"contributes": {
+		"commands": [
+			{
+				"command": "cursorDailyCredits.openDashboard",
+				"title": "Cursor Daily Credits: Open Dashboard"
+			},
+			{
+				"command": "cursorDailyCredits.refreshUsage",
+				"title": "Cursor Daily Credits: Refresh Live Usage"
+			},
+			{
+				"command": "cursorDailyCredits.openUsagePage",
+				"title": "Cursor Daily Credits: Open Cursor Usage & Plans"
+			},
+			{
+				"command": "cursorDailyCredits.showLogs",
+				"title": "Cursor Daily Credits: Show Logs"
+			}
+		],
+		"configuration": {
+			"title": "Cursor Daily Credits",
+			"properties": {
+				"cursorDailyCredits.refreshIntervalMinutes": {
+					"type": "number",
+					"default": 5,
+					"minimum": 1,
+					"maximum": 60,
+					"description": "How often to refresh your live Cursor usage."
+				},
+				"cursorDailyCredits.warningThresholdPercent": {
+					"type": "number",
+					"default": 80,
+					"minimum": 1,
+					"maximum": 100,
+					"description": "Show an in-editor warning after this percentage of today’s allowance is used."
+				},
+				"cursorDailyCredits.namespace": {
+					"type": "string",
+					"default": "Teaya",
+					"description": "Cursor team namespace whose usage events fill the daily graph."
+				}
+			}
+		}
+	}
+}
