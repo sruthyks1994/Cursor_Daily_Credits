@@ -63,7 +63,7 @@
 				},
 				"cursorDailyCredits.namespace": {
 					"type": "string",
-					"default": "Teaya",
+					"default": "Taeya",
 					"description": "Cursor team namespace whose usage events fill the daily graph."
 				}
 			}

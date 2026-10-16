@@ -12,7 +12,7 @@ const LEGACY_URL = 'https://cursor.com/api/usage';
 const PLAN_URL = 'https://cursor.com/api/auth/stripe';
 const EVENTS_URL = 'https://cursor.com/api/dashboard/get-filtered-usage-events';
 const TEAMS_URL = 'https://cursor.com/api/dashboard/teams';
-const DEFAULT_NAMESPACE = 'Teaya';
+const DEFAULT_NAMESPACE = 'Taeya';
 let statusItem;
 let panel;
 let output;

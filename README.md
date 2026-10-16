@@ -28,7 +28,7 @@ A Cursor-compatible extension that reads your signed-in plan and the same percen
 
 The two pools are Cursor Models (includes Cursor Grok and Composer) and Other Models. The opening snapshot for each local day stays fixed, so later refreshes compare against that day's target.
 
-The graph covers every day of the current billing cycle. Each day's used percent is that day's share of the cycle's Plan & Usage percent, weighted by charged amount when Cursor reports one and by requests otherwise. The label on each day is that used percent. A day's allowance is the percent still left at the start of that day, divided by the days left until reset. Usage events are read for the team namespace `Teaya`.
+The graph covers every day of the current billing cycle. Each day's used percent is that day's share of the cycle's Plan & Usage percent, weighted by charged amount when Cursor reports one and by requests otherwise. The label on each day is that used percent. A day's allowance is the percent still left at the start of that day, divided by the days left until reset. Usage events are read for the team namespace `Taeya`.
 
 **First check of the day:** the percent "used today" on the meter starts at the first successful sync. Usage events from earlier the same day still appear in the graph and in "What you used today".
 
