@@ -16,7 +16,7 @@ A Cursor-compatible extension that reads your signed-in plan and the same percen
 
 ## Install
 
-1. Share `cursor-daily-credits-1.3.8.vsix`.
+1. Share `cursor-daily-credits-1.3.9.vsix`.
 2. In Cursor press `Ctrl+Shift+P`.
 3. Run `Extensions: Install from VSIX...` and select the file.
 4. Reload Cursor if the extension does not activate.
