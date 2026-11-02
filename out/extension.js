@@ -3,16 +3,24 @@ const vscode = require('vscode');
 const fs = require('fs');
 const path = require('path');
 const https = require('https');
-const { execFile } = require('child_process');
+const { execFile, execFileSync } = require('child_process');
 
 const STORAGE_KEY = 'cursorDailyCredits.dailySnapshots.v4';
 const DEFAULT_WARN_AT_PERCENT = 80;
+const PERIOD_URL = 'https://cursor.com/api/dashboard/get-current-period-usage';
+const SUMMARY_URL = 'https://cursor.com/api/usage-summary';
+const CSRF_URL = 'https://cursor.com/api/csrf-token';
 const USAGE_URL = 'https://api2.cursor.sh/aiserver.v1.DashboardService/GetCurrentPeriodUsage';
+const AUTH_USAGE_URL = 'https://api2.cursor.sh/auth/usage';
+const OAUTH_URL = 'https://api2.cursor.sh/oauth/token';
 const LEGACY_URL = 'https://cursor.com/api/usage';
 const PLAN_URL = 'https://cursor.com/api/auth/stripe';
 const EVENTS_URL = 'https://cursor.com/api/dashboard/get-filtered-usage-events';
 const TEAMS_URL = 'https://cursor.com/api/dashboard/teams';
+const AUTH_CLIENT_ID = 'KbZUR41cY7W6zRSdpSUJ7I7mLYBKOCmB';
+const SEALED_TOKEN_PREFIX = 'cursor-safe-storage:v1:';
 const DEFAULT_NAMESPACE = 'Taeya';
+let cachedOsCryptKey = null;
 let statusItem;
 let panel;
 let output;
@@ -128,7 +136,25 @@ function cursorStoragePaths() {
   const base = path.join(home, '.config', 'Cursor');
   return [path.join(base, 'sentry', 'scope_v3.json'), path.join(base, 'sentry', 'session.json'), path.join(base, 'User', 'globalStorage', 'storage.json'), path.join(base, 'storage.json'), path.join(home, '.cursor', 'storage.json')];
 }
-function getUserId() {
+function userIdFromToken(token) {
+  const payload = decodeJwtPayload(token);
+  if (!payload) return null;
+  const candidates = [payload.sub, payload.user_id, payload.userId, payload.id];
+  for (const value of candidates) {
+    if (typeof value !== 'string' || !value.trim()) continue;
+    const match = value.match(/user_[A-Za-z0-9_-]{10,}/);
+    if (match) return match[0];
+    if (value.startsWith('user_')) return value;
+  }
+  return null;
+}
+function getUserId(token) {
+  // Prefer the JWT subject. Stale IDs in local metadata files break cookie auth.
+  const fromToken = userIdFromToken(token);
+  if (fromToken) {
+    log('Using signed-in Cursor user ID from the local access token.');
+    return fromToken;
+  }
   const paths = cursorStoragePaths();
   for (const file of paths) {
     try {
@@ -158,38 +184,246 @@ function runFile(command, args, timeout = 8000) {
     resolve((stdout || '').trim());
   }));
 }
-async function readTokenWithPython(dbPath) {
-  const code = "import sqlite3,sys; c=sqlite3.connect(sys.argv[1], timeout=3); c.execute('PRAGMA query_only=ON'); r=c.execute(\"SELECT value FROM ItemTable WHERE key='cursorAuth/accessToken' LIMIT 1\").fetchone(); print(r[0] if r and r[0] else ''); c.close()";
+function decodeStoredValue(value) {
+  if (value == null) return null;
+  let token = typeof value === 'string' ? value : null;
+  if (!token) return null;
+  try {
+    const decoded = JSON.parse(token);
+    if (typeof decoded === 'string') token = decoded;
+  } catch { /* stored as plain text */ }
+  return token && token.trim() ? token.trim() : null;
+}
+function cursorSupportRoot() {
+  const home = process.env.USERPROFILE || process.env.HOME || '';
+  if (process.platform === 'win32') {
+    return path.join(process.env.APPDATA || path.join(home, 'AppData', 'Roaming'), 'Cursor');
+  }
+  if (process.platform === 'darwin') {
+    return path.join(home, 'Library', 'Application Support', 'Cursor');
+  }
+  return path.join(process.env.XDG_CONFIG_HOME || path.join(home, '.config'), 'Cursor');
+}
+function cursorStateDbPath() {
+  return path.join(cursorSupportRoot(), 'User', 'globalStorage', 'state.vscdb');
+}
+function cursorLocalStatePath() {
+  return path.join(cursorSupportRoot(), 'Local State');
+}
+function isSealedAuthToken(value) {
+  return typeof value === 'string' && value.startsWith(SEALED_TOKEN_PREFIX);
+}
+function dpapiUnprotectBase64(protectedBase64) {
+  const script = [
+    "Add-Type -AssemblyName System.Security",
+    `$bytes = [Convert]::FromBase64String('${protectedBase64.replace(/'/g, "''")}')`,
+    '$plain = [System.Security.Cryptography.ProtectedData]::Unprotect($bytes, $null, [System.Security.Cryptography.DataProtectionScope]::CurrentUser)',
+    '[Convert]::ToBase64String($plain)',
+  ].join('; ');
+  const out = execFileSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command', script], {
+    windowsHide: true,
+    timeout: 15000,
+    encoding: 'utf8',
+    maxBuffer: 1024 * 1024,
+  }).trim();
+  if (!out) throw new Error('DPAPI returned an empty key.');
+  return Buffer.from(out, 'base64');
+}
+function readWindowsOsCryptKey() {
+  if (cachedOsCryptKey) return cachedOsCryptKey;
+  const localStatePath = cursorLocalStatePath();
+  if (!fs.existsSync(localStatePath)) throw new Error('Cursor Local State file was not found.');
+  const localState = JSON.parse(fs.readFileSync(localStatePath, 'utf8'));
+  const encryptedKeyB64 = localState && localState.os_crypt && localState.os_crypt.encrypted_key;
+  if (typeof encryptedKeyB64 !== 'string' || !encryptedKeyB64) throw new Error('Cursor OSCrypt key was missing.');
+  const encryptedKey = Buffer.from(encryptedKeyB64, 'base64');
+  if (encryptedKey.slice(0, 5).toString('utf8') !== 'DPAPI') throw new Error('Cursor OSCrypt key was not DPAPI-wrapped.');
+  cachedOsCryptKey = dpapiUnprotectBase64(encryptedKey.slice(5).toString('base64'));
+  return cachedOsCryptKey;
+}
+function readMacOsCryptKey() {
+  if (cachedOsCryptKey) return cachedOsCryptKey;
+  // Chromium safe storage password for Cursor on macOS.
+  const out = execFileSync('security', ['find-generic-password', '-w', '-s', 'Cursor Safe Storage', '-a', 'Cursor'], {
+    timeout: 15000,
+    encoding: 'utf8',
+    maxBuffer: 1024 * 1024,
+  }).trim();
+  if (!out) throw new Error('macOS Keychain returned an empty Cursor Safe Storage password.');
+  const cryptoMod = require('crypto');
+  cachedOsCryptKey = cryptoMod.pbkdf2Sync(Buffer.from(out, 'utf8'), Buffer.from('saltysalt'), 1003, 16, 'sha1');
+  return cachedOsCryptKey;
+}
+function decryptChromiumV10(cipherBuf, key) {
+  const cryptoMod = require('crypto');
+  if (key.length === 16) {
+    // macOS Chromium uses AES-128-CBC with an empty IV of spaces for older cookies;
+    // Electron safeStorage v10 on macOS is typically AES-128-CBC.
+    const iv = Buffer.alloc(16, ' ');
+    const decipher = cryptoMod.createDecipheriv('aes-128-cbc', key, iv);
+    decipher.setAutoPadding(true);
+    return Buffer.concat([decipher.update(cipherBuf.slice(3)), decipher.final()]).toString('utf8');
+  }
+  const iv = cipherBuf.slice(3, 15);
+  const tag = cipherBuf.slice(-16);
+  const data = cipherBuf.slice(15, -16);
+  const decipher = cryptoMod.createDecipheriv('aes-256-gcm', key, iv);
+  decipher.setAuthTag(tag);
+  return Buffer.concat([decipher.update(data), decipher.final()]).toString('utf8');
+}
+function unwrapAuthToken(raw) {
+  const value = decodeStoredValue(raw);
+  if (!value) return null;
+  if (!isSealedAuthToken(value)) return value;
+  const encoded = value.slice(SEALED_TOKEN_PREFIX.length);
+  const cipherBuf = Buffer.from(encoded, 'base64');
+  if (cipherBuf.length < 4) throw new Error('Sealed Cursor token was truncated.');
+  const prefix = cipherBuf.slice(0, 3).toString('utf8');
+  if (prefix !== 'v10' && prefix !== 'v11') {
+    throw new Error(`Unsupported sealed Cursor token prefix (${prefix}).`);
+  }
+  let key;
+  if (process.platform === 'win32') key = readWindowsOsCryptKey();
+  else if (process.platform === 'darwin') key = readMacOsCryptKey();
+  else throw new Error('Encrypted Cursor tokens are not supported on this OS yet.');
+  const plain = decryptChromiumV10(cipherBuf, key).trim();
+  if (!plain) throw new Error('Decrypted Cursor token was empty.');
+  return plain;
+}
+async function readAuthKeysWithPython(dbPath, keys) {
+  const keyList = JSON.stringify(keys);
+  const code = "import sqlite3,sys,json; keys=json.loads(sys.argv[2]); c=sqlite3.connect(sys.argv[1], timeout=3); c.execute('PRAGMA query_only=ON'); out={};\nfor k in keys:\n r=c.execute('SELECT value FROM ItemTable WHERE key=? LIMIT 1',(k,)).fetchone();\n out[k]=r[0] if r and r[0] is not None else None\nprint(json.dumps(out)); c.close()";
   const commands = process.platform === 'win32' ? ['python', 'py', 'python3'] : ['python3', 'python'];
   for (const cmd of commands) {
     try {
-      const args = cmd === 'py' ? ['-3', '-c', code, dbPath] : ['-c', code, dbPath];
-      const token = await runFile(cmd, args);
-      if (token) return token;
+      const args = cmd === 'py' ? ['-3', '-c', code, dbPath, keyList] : ['-c', code, dbPath, keyList];
+      const raw = await runFile(cmd, args);
+      if (!raw) continue;
+      return JSON.parse(raw);
     } catch { /* try another Python command */ }
   }
   return null;
 }
-async function readAccessToken() {
-  const home = process.env.USERPROFILE || process.env.HOME || '';
-  const dbPath = process.platform === 'win32'
-    ? path.join(process.env.APPDATA || path.join(home, 'AppData', 'Roaming'), 'Cursor', 'User', 'globalStorage', 'state.vscdb')
-    : process.platform === 'darwin'
-      ? path.join(home, 'Library', 'Application Support', 'Cursor', 'User', 'globalStorage', 'state.vscdb')
-      : path.join(home, '.config', 'Cursor', 'User', 'globalStorage', 'state.vscdb');
-  if (!fs.existsSync(dbPath)) { log('Cursor session database was not found in the usual location.'); return null; }
-  // Prefer Node's SQLite module when available (newer Cursor runtimes); fall back to local Python sqlite3.
-  try {
-    const { DatabaseSync } = require('node:sqlite');
-    const db = new DatabaseSync(dbPath, { readOnly: true });
+function readAuthKeysWithNode(dbPath, keys) {
+  const { DatabaseSync } = require('node:sqlite');
+  const openers = [
+    () => new DatabaseSync(dbPath, { readOnly: true }),
+    () => new DatabaseSync(`file:${dbPath.replace(/\\/g, '/')}?immutable=1`, { readOnly: true }),
+  ];
+  let lastError = null;
+  for (const open of openers) {
     try {
-      const row = db.prepare("SELECT value FROM ItemTable WHERE key = 'cursorAuth/accessToken' LIMIT 1").get();
-      let token = row && typeof row.value === 'string' ? row.value : null;
-      if (token) { try { const decoded = JSON.parse(token); if (typeof decoded === 'string') token = decoded; } catch { /* token was stored as plain text */ } return token; }
-    } finally { db.close(); }
-  } catch (e) { log('Built-in SQLite reader is unavailable here; trying local Python SQLite.'); }
-  const token = await readTokenWithPython(dbPath);
-  return token || null;
+      const db = open();
+      try {
+        const out = {};
+        for (const key of keys) {
+          const row = db.prepare('SELECT value FROM ItemTable WHERE key = ? LIMIT 1').get(key);
+          out[key] = row ? row.value : null;
+        }
+        return out;
+      } finally { db.close(); }
+    } catch (error) {
+      lastError = error;
+    }
+  }
+  throw lastError || new Error('SQLite open failed');
+}
+async function readAuthBundle() {
+  const dbPath = cursorStateDbPath();
+  if (!fs.existsSync(dbPath)) {
+    log('Cursor session database was not found in the usual location.');
+    return { accessToken: null, refreshToken: null };
+  }
+  const keys = ['cursorAuth/accessToken', 'cursorAuth/refreshToken'];
+  let raw = null;
+  try {
+    raw = readAuthKeysWithNode(dbPath, keys);
+  } catch (e) {
+    log('Built-in SQLite reader is unavailable here; trying local Python SQLite.');
+    raw = await readAuthKeysWithPython(dbPath, keys);
+  }
+  const sealedAccess = decodeStoredValue(raw && raw['cursorAuth/accessToken']);
+  const sealedRefresh = decodeStoredValue(raw && raw['cursorAuth/refreshToken']);
+  let accessToken = null;
+  let refreshToken = null;
+  try {
+    if (sealedAccess) {
+      if (isSealedAuthToken(sealedAccess)) log('Decrypting Cursor access token from safe storage.');
+      accessToken = unwrapAuthToken(sealedAccess);
+    }
+  } catch (error) {
+    log(`Could not unwrap access token: ${error instanceof Error ? error.message : String(error)}`);
+  }
+  try {
+    if (sealedRefresh) {
+      if (isSealedAuthToken(sealedRefresh)) log('Decrypting Cursor refresh token from safe storage.');
+      refreshToken = unwrapAuthToken(sealedRefresh);
+    }
+  } catch (error) {
+    log(`Could not unwrap refresh token: ${error instanceof Error ? error.message : String(error)}`);
+  }
+  return { accessToken, refreshToken };
+}
+function decodeJwtPayload(token) {
+  try {
+    const parts = String(token || '').split('.');
+    if (parts.length < 2) return null;
+    const json = Buffer.from(parts[1].replace(/-/g, '+').replace(/_/g, '/'), 'base64').toString('utf8');
+    return JSON.parse(json);
+  } catch {
+    return null;
+  }
+}
+function tokenSecondsRemaining(token) {
+  const payload = decodeJwtPayload(token);
+  if (!payload || !Number.isFinite(Number(payload.exp))) return null;
+  return Number(payload.exp) - Math.floor(Date.now() / 1000);
+}
+async function refreshAccessToken(refreshToken) {
+  const data = await requestJson(OAUTH_URL, {
+    method: 'POST',
+    headers: { 'x-cursor-client-type': 'ide' },
+    body: {
+      grant_type: 'refresh_token',
+      client_id: AUTH_CLIENT_ID,
+      refresh_token: refreshToken,
+    },
+  });
+  if (data && data.shouldLogout) throw new Error('Cursor rejected the refresh token (shouldLogout).');
+  const access = data && (data.access_token || data.accessToken);
+  if (typeof access !== 'string' || !access.trim()) throw new Error('Cursor token refresh returned no access token.');
+  return {
+    accessToken: access.trim(),
+    refreshToken: typeof (data.refresh_token || data.refreshToken) === 'string'
+      ? String(data.refresh_token || data.refreshToken).trim()
+      : refreshToken,
+  };
+}
+async function resolveAccessToken() {
+  const bundle = await readAuthBundle();
+  let accessToken = bundle.accessToken;
+  let refreshToken = bundle.refreshToken;
+  if (!accessToken && !refreshToken) {
+    throw new Error('Could not read a usable Cursor session token. If Cursor encrypts auth at rest, decryption may have failed—check Show Logs, then sign out/in of Cursor and try again.');
+  }
+  const remaining = accessToken ? tokenSecondsRemaining(accessToken) : -1;
+  if (accessToken && (remaining === null || remaining > 120)) {
+    if (remaining !== null) log(`Local access token is valid for about ${Math.max(0, Math.round(remaining / 60))} minute(s).`);
+    return accessToken;
+  }
+  if (!refreshToken) {
+    log('Access token is expired or near expiry, and no refresh token was found.');
+    return accessToken;
+  }
+  try {
+    log(accessToken ? 'Refreshing near-expiry Cursor access token.' : 'Refreshing missing Cursor access token.');
+    const refreshed = await refreshAccessToken(refreshToken);
+    log('Access token refresh succeeded.');
+    return refreshed.accessToken;
+  } catch (error) {
+    log(`Access token refresh failed: ${error instanceof Error ? error.message : String(error)}`);
+    return accessToken;
+  }
 }
 function requestJson(urlText, options = {}) {
   return new Promise((resolve, reject) => {
@@ -197,15 +431,17 @@ function requestJson(urlText, options = {}) {
     if (url.protocol !== 'https:' || !['cursor.com', 'api2.cursor.sh'].includes(url.hostname)) {
       reject(new Error('Blocked unexpected usage endpoint.')); return;
     }
+    const hasJsonBody = options.body !== undefined && options.body !== null && !options.rawBody;
+    const rawBody = options.rawBody != null ? String(options.rawBody) : (hasJsonBody ? JSON.stringify(options.body) : null);
     const req = https.request({
       hostname: url.hostname,
       port: 443,
       path: url.pathname + url.search,
       method: options.method || 'GET',
       headers: {
-        'User-Agent': 'Cursor-Daily-Credits/1.3',
+        'User-Agent': 'Cursor-Daily-Credits/1.4.2',
         'Accept': 'application/json',
-        ...(options.body ? { 'Content-Type': 'application/json' } : {}),
+        ...(hasJsonBody ? { 'Content-Type': 'application/json' } : {}),
         ...(options.headers || {}),
       },
     }, res => {
@@ -214,19 +450,84 @@ function requestJson(urlText, options = {}) {
       res.on('data', part => { text += part; if (text.length > 2 * 1024 * 1024) req.destroy(new Error('Usage response was unexpectedly large.')); });
       res.on('end', () => {
         const status = res.statusCode || 0;
-        if (status < 200 || status >= 300) { reject(new Error(`Cursor usage endpoint returned HTTP ${status}.`)); return; }
+        if (status >= 300 && status < 400) {
+          const location = res.headers && res.headers.location ? String(res.headers.location) : '';
+          reject(new Error(`Cursor usage endpoint redirected (${status})${location ? `: ${location}` : '.'}`));
+          return;
+        }
+        if (status < 200 || status >= 300) {
+          const hint = text && text.length < 240 ? ` ${text.trim()}` : '';
+          reject(new Error(`Cursor usage endpoint returned HTTP ${status}.${hint}`));
+          return;
+        }
         try { resolve(JSON.parse(text)); }
         catch { reject(new Error('Cursor returned a response that was not valid JSON.')); }
       });
     });
     req.setTimeout(15000, () => req.destroy(new Error('Timed out contacting Cursor usage service.')));
     req.on('error', reject);
-    if (options.body) req.write(JSON.stringify(options.body));
+    if (rawBody) req.write(rawBody);
     req.end();
   });
 }
 function buildCookie(userId, token) {
   return `WorkosCursorSessionToken=${userId}%3A%3A${token}`;
+}
+function dashboardHeaders(cookie, csrfToken) {
+  const cookieValue = csrfToken ? `${cookie}; csrf-token=${csrfToken}` : cookie;
+  const headers = {
+    Cookie: cookieValue,
+    Origin: 'https://cursor.com',
+    Referer: 'https://cursor.com/dashboard?tab=usage',
+  };
+  if (csrfToken) headers['x-csrf-token'] = csrfToken;
+  return headers;
+}
+async function fetchCsrfToken(cookie) {
+  const data = await requestJson(CSRF_URL, { headers: dashboardHeaders(cookie) });
+  const token = data && typeof data.token === 'string' ? data.token.trim() : '';
+  if (!token) throw new Error('Cursor CSRF token was empty.');
+  return token;
+}
+function fromUsageSummary(summary) {
+  if (!summary || typeof summary !== 'object') return null;
+  const individual = summary.individualUsage && typeof summary.individualUsage === 'object' ? summary.individualUsage : null;
+  const team = summary.teamUsage && typeof summary.teamUsage === 'object' ? summary.teamUsage : null;
+  const planUsageRaw = (individual && (individual.plan || individual.overall))
+    || (team && (team.plan || team.overall))
+    || null;
+  if (!planUsageRaw || typeof planUsageRaw !== 'object') return null;
+  const breakdown = planUsageRaw.breakdown && typeof planUsageRaw.breakdown === 'object' ? planUsageRaw.breakdown : null;
+  return {
+    billingCycleStart: summary.billingCycleStart,
+    billingCycleEnd: summary.billingCycleEnd,
+    displayMessage: summary.autoModelSelectedDisplayMessage
+      || summary.namedModelSelectedDisplayMessage
+      || summary.displayMessage
+      || null,
+    planUsage: {
+      autoPercentUsed: planUsageRaw.autoPercentUsed,
+      apiPercentUsed: planUsageRaw.apiPercentUsed,
+      totalPercentUsed: planUsageRaw.totalPercentUsed,
+      used: planUsageRaw.used,
+      limit: planUsageRaw.limit,
+      remaining: planUsageRaw.remaining,
+      includedSpend: breakdown ? breakdown.included : planUsageRaw.includedSpend,
+      bonusSpend: breakdown ? breakdown.bonus : planUsageRaw.bonusSpend,
+      totalSpend: breakdown ? breakdown.total : planUsageRaw.totalSpend,
+    },
+  };
+}
+function planFromSummary(summary) {
+  if (!summary || typeof summary !== 'object') return null;
+  const membership = summary.membershipType || summary.individualMembershipType;
+  if (!membership && summary.isTeamMember == null) return null;
+  return {
+    membershipType: membership,
+    individualMembershipType: membership,
+    isTeamMember: !!summary.isTeamMember || String(membership || '').toLowerCase() === 'enterprise',
+    teamId: summary.teamId,
+  };
 }
 function finiteNumber(value) {
   if (value === null || value === undefined || value === '') return NaN;
@@ -357,30 +658,77 @@ function normalizeUsage(current, legacy, plan) {
   }
   return null;
 }
+function settledMessage(result) {
+  if (!result || result.status !== 'rejected') return '';
+  return result.reason && result.reason.message ? String(result.reason.message) : 'unknown error';
+}
 async function fetchCursorData() {
-  const userId = getUserId();
-  if (!userId) throw new Error('Could not find your signed-in Cursor account. Open Cursor and sign in, then run Refresh Usage.');
-  const token = await readAccessToken();
+  const token = await resolveAccessToken();
   if (!token) throw new Error('Could not read Cursor’s local session token. Restart Cursor and try again. No token was sent to any service other than Cursor.');
+  if (isSealedAuthToken(token) || tokenSecondsRemaining(token) === null && !token.includes('.')) {
+    throw new Error('Cursor’s access token is still encrypted or unreadable. Sign out and back into Cursor, then run Refresh Usage.');
+  }
+  const userId = getUserId(token);
+  if (!userId) throw new Error('Could not find your signed-in Cursor account. Open Cursor and sign in, then run Refresh Usage.');
   const cookie = buildCookie(userId, token);
-  const [currentResult, legacyResult, planResult] = await Promise.allSettled([
-    requestJson(USAGE_URL, { method: 'POST', headers: { 'Authorization': `Bearer ${token}`, 'Connect-Protocol-Version': '1' }, body: {} }),
-    requestJson(`${LEGACY_URL}?user=${encodeURIComponent(userId)}`, { headers: { 'Cookie': cookie } }),
-    requestJson(PLAN_URL, { headers: { 'Cookie': cookie } }),
+  let csrf = null;
+  try {
+    csrf = await fetchCsrfToken(cookie);
+    log('Fetched Cursor CSRF token for dashboard POSTs.');
+  } catch (error) {
+    log(`CSRF token unavailable: ${error instanceof Error ? error.message : String(error)}`);
+  }
+  const dash = dashboardHeaders(cookie, csrf);
+  const connectHeaders = {
+    Authorization: `Bearer ${token}`,
+    'Connect-Protocol-Version': '1',
+    'x-cursor-client-type': 'ide',
+  };
+  const [periodResult, summaryCookieResult, summaryBearerResult, currentResult, authUsageResult, legacyResult, planResult] = await Promise.allSettled([
+    requestJson(PERIOD_URL, { method: 'POST', headers: dash, body: {} }),
+    requestJson(SUMMARY_URL, { headers: dash }),
+    requestJson(SUMMARY_URL, { headers: { Authorization: `Bearer ${token}`, 'x-cursor-client-type': 'ide' } }),
+    requestJson(USAGE_URL, { method: 'POST', headers: connectHeaders, body: {} }),
+    requestJson(AUTH_USAGE_URL, { headers: { Authorization: `Bearer ${token}`, 'x-cursor-client-type': 'ide' } }),
+    requestJson(`${LEGACY_URL}?user=${encodeURIComponent(userId)}`, { headers: { Cookie: cookie } }),
+    requestJson(PLAN_URL, { headers: dash }),
   ]);
-  const current = currentResult.status === 'fulfilled' ? currentResult.value : null;
-  const legacy = legacyResult.status === 'fulfilled' ? legacyResult.value : null;
-  const plan = planResult.status === 'fulfilled' ? planResult.value : null;
-  if (currentResult.status === 'rejected') log(`Current usage endpoint unavailable: ${currentResult.reason && currentResult.reason.message || 'unknown error'}`);
-  if (legacyResult.status === 'rejected') log(`Legacy usage endpoint unavailable: ${legacyResult.reason && legacyResult.reason.message || 'unknown error'}`);
-  if (planResult.status === 'rejected') log(`Plan metadata endpoint unavailable: ${planResult.reason && planResult.reason.message || 'unknown error'}`);
+  const period = periodResult.status === 'fulfilled' ? periodResult.value : null;
+  const summary = summaryCookieResult.status === 'fulfilled'
+    ? summaryCookieResult.value
+    : (summaryBearerResult.status === 'fulfilled' ? summaryBearerResult.value : null);
+  const connect = currentResult.status === 'fulfilled' ? currentResult.value : null;
+  // Prefer the dashboard period endpoint (matches Settings → Plan & Usage), then Connect RPC, then usage-summary.
+  const current = period || connect || fromUsageSummary(summary);
+  const legacy = legacyResult.status === 'fulfilled'
+    ? legacyResult.value
+    : (authUsageResult.status === 'fulfilled' ? authUsageResult.value : null);
+  const plan = (planResult.status === 'fulfilled' ? planResult.value : null) || planFromSummary(summary);
+  if (periodResult.status === 'rejected') log(`Dashboard period usage unavailable: ${settledMessage(periodResult)}`);
+  if (summaryCookieResult.status === 'rejected') log(`Usage summary (cookie) unavailable: ${settledMessage(summaryCookieResult)}`);
+  if (summaryBearerResult.status === 'rejected') log(`Usage summary (bearer) unavailable: ${settledMessage(summaryBearerResult)}`);
+  if (currentResult.status === 'rejected') log(`Connect usage endpoint unavailable: ${settledMessage(currentResult)}`);
+  if (authUsageResult.status === 'rejected') log(`Auth usage endpoint unavailable: ${settledMessage(authUsageResult)}`);
+  if (legacyResult.status === 'rejected') log(`Legacy usage endpoint unavailable: ${settledMessage(legacyResult)}`);
+  if (planResult.status === 'rejected') log(`Plan metadata endpoint unavailable: ${settledMessage(planResult)}`);
   const normalized = normalizeUsage(current, legacy, plan);
   if (!normalized) {
-    if (currentResult.status === 'rejected' && legacyResult.status === 'rejected') throw new Error('Cursor usage could not be retrieved. The unofficial endpoint may have changed or your session may have expired.');
+    const allFailed = periodResult.status === 'rejected'
+      && summaryCookieResult.status === 'rejected'
+      && summaryBearerResult.status === 'rejected'
+      && currentResult.status === 'rejected'
+      && authUsageResult.status === 'rejected'
+      && legacyResult.status === 'rejected';
+    if (allFailed) {
+      const sample = [periodResult, summaryCookieResult, currentResult, authUsageResult, legacyResult]
+        .map(settledMessage)
+        .filter(Boolean)[0] || 'no details';
+      throw new Error(`Cursor usage could not be retrieved. The unofficial endpoint may have changed or your session may have expired. (${sample})`);
+    }
     throw new Error('Cursor returned data, but no supported usage allowance could be identified for this plan.');
   }
-  const team = await resolveNamespace(cookie, plan);
-  const history = await loadUsageHistory(cookie, team.teamId, normalized.start, normalized.end);
+  const team = await resolveNamespace(cookie, csrf, plan);
+  const history = await loadUsageHistory(cookie, csrf, team.teamId, normalized.start, normalized.end);
   return {
     ...normalized,
     history,
@@ -408,11 +756,11 @@ function teamNumericId(team) {
   const id = Number(team.id || team.teamId);
   return Number.isFinite(id) && id > 0 ? id : 0;
 }
-async function resolveNamespace(cookie, plan) {
+async function resolveNamespace(cookie, csrf, plan) {
   const wanted = configuredNamespace();
   let teams = [];
   try {
-    const data = await requestJson(TEAMS_URL, { headers: { Cookie: cookie, Origin: 'https://cursor.com', Referer: 'https://cursor.com/dashboard' } });
+    const data = await requestJson(TEAMS_URL, { headers: dashboardHeaders(cookie, csrf) });
     teams = teamRecords(data);
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
@@ -512,7 +860,7 @@ function summarizeHistory(events, start, end) {
     measure: days.some(day => day.cents > 0) ? 'cents' : 'requests',
   };
 }
-async function loadUsageHistory(cookie, teamId, start, end) {
+async function loadUsageHistory(cookie, csrf, teamId, start, end) {
   const startMs = start instanceof Date && Number.isFinite(start.getTime()) ? start.getTime() : Date.now() - 31 * 86400000;
   const cycleEndMs = end instanceof Date && Number.isFinite(end.getTime()) ? end.getTime() : Date.now();
   const endMs = Math.min(cycleEndMs, Date.now());
@@ -521,7 +869,7 @@ async function loadUsageHistory(cookie, teamId, start, end) {
     for (let page = 1; page <= 15; page++) {
       const data = await requestJson(EVENTS_URL, {
         method: 'POST',
-        headers: { Cookie: cookie, Origin: 'https://cursor.com', Referer: 'https://cursor.com/dashboard' },
+        headers: dashboardHeaders(cookie, csrf),
         body: { teamId, startDate: String(startMs), endDate: String(endMs), page, pageSize: 100 },
       });
       const rows = data && Array.isArray(data.usageEventsDisplay) ? data.usageEventsDisplay : [];

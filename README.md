@@ -16,7 +16,7 @@ A Cursor-compatible extension that reads your signed-in plan and the same percen
 
 ## Install
 
-1. Share `cursor-daily-credits-1.3.9.vsix`.
+1. Share `cursor-daily-credits-1.4.2.vsix`.
 2. In Cursor press `Ctrl+Shift+P`.
 3. Run `Extensions: Install from VSIX...` and select the file.
 4. Reload Cursor if the extension does not activate.
@@ -34,6 +34,8 @@ The graph covers every day of the current billing cycle. Each day's used percent
 
 ## Privacy and compatibility
 
-This is an unofficial integration. Cursor does not document a public API for individual plan usage. The extension reads the local Cursor user ID and access token so it can call `cursor.com` and `api2.cursor.sh`. It does not upload the token anywhere else. A Cursor update may change these endpoints.
+This is an unofficial integration. Cursor does not document a public API for individual plan usage. The extension reads the local Cursor user ID and access token so it can call Cursor’s dashboard endpoints (`/api/dashboard/get-current-period-usage`, `/api/usage-summary`, and related routes) plus `api2.cursor.sh` as a fallback. It does not upload the token anywhere else. A Cursor update may change these endpoints.
+
+Recent Cursor builds encrypt `cursorAuth/accessToken` at rest as `cursor-safe-storage:v1:`. On Windows the extension unwraps that with Cursor’s OSCrypt key from `Local State` (DPAPI). Without that unwrap, every usage call returns 401.
 
 The extension prefers Node's built-in SQLite reader and falls back to local Python (`python`, `py`, or `python3`) to read Cursor's session database. Use `Cursor Daily Credits: Show Logs` if the live data does not load.
