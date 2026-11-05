@@ -1,8 +1,8 @@
 {
 	"name": "cursor-daily-credits",
 	"displayName": "Cursor Daily Credits",
-	"description": "Shows Cursor Models and Other Models daily allowances, what you used today, a daily history graph, and the models behind that usage.",
-	"version": "1.4.2",
+	"description": "Shows Cursor Models, Other Models, and Grok Bot daily allowances, what you used today, a daily history graph, and the models behind that usage.",
+	"version": "1.5.0",
 	"publisher": "Teaya",
 	"icon": "icon.png",
 	"license": "MIT",

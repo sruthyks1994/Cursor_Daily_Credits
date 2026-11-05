@@ -17,6 +17,8 @@ const LEGACY_URL = 'https://cursor.com/api/usage';
 const PLAN_URL = 'https://cursor.com/api/auth/stripe';
 const EVENTS_URL = 'https://cursor.com/api/dashboard/get-filtered-usage-events';
 const TEAMS_URL = 'https://cursor.com/api/dashboard/teams';
+const SAND_URL = 'https://cursor.com/api/dashboard/get-sand-usage-status';
+const SAND_CONNECT_URL = 'https://api2.cursor.sh/aiserver.v1.DashboardService/GetSandUsageStatus';
 const AUTH_CLIENT_ID = 'KbZUR41cY7W6zRSdpSUJ7I7mLYBKOCmB';
 const SEALED_TOKEN_PREFIX = 'cursor-safe-storage:v1:';
 const DEFAULT_NAMESPACE = 'Taeya';
@@ -439,7 +441,7 @@ function requestJson(urlText, options = {}) {
       path: url.pathname + url.search,
       method: options.method || 'GET',
       headers: {
-        'User-Agent': 'Cursor-Daily-Credits/1.4.2',
+        'User-Agent': 'Cursor-Daily-Credits/1.5.0',
         'Accept': 'application/json',
         ...(hasJsonBody ? { 'Content-Type': 'application/json' } : {}),
         ...(options.headers || {}),
@@ -553,10 +555,10 @@ function normalizeUsage(current, legacy, plan) {
     const apiUsed = finiteNumber(usage.apiPercentUsed);
     const pools = [];
     if (Number.isFinite(autoUsed) && autoUsed >= 0) {
-      pools.push({ id: 'cursor', label: 'Cursor Models', detail: 'Includes Cursor Grok and Composer', used: autoUsed });
+      pools.push({ id: 'cursor', label: 'Cursor Models', detail: 'Includes Composer and Auto-routed Cursor models', used: autoUsed });
     }
     if (Number.isFinite(apiUsed) && apiUsed >= 0) {
-      pools.push({ id: 'other', label: 'Other Models', detail: 'Models outside Cursor Models.', used: apiUsed });
+      pools.push({ id: 'other', label: 'Other Models', detail: 'Named / API models outside Cursor Models.', used: apiUsed });
     }
     if (pools.length) {
       const primary = pools[0];
@@ -658,6 +660,38 @@ function normalizeUsage(current, legacy, plan) {
   }
   return null;
 }
+function normalizeSand(sand) {
+  if (!sand || typeof sand !== 'object') return null;
+  if (sand.includedLimitZero || sand.usesPooledEnterpriseAllowance) return null;
+  if (sand.hasNonZeroIncludedLimit === false) return null;
+  const used = finiteNumber(sand.usagePercent ?? sand.usage_percent);
+  if (!Number.isFinite(used) || used < 0) return null;
+  const start = parseDate(sand.currentPeriodStart || sand.current_period_start);
+  const end = parseDate(sand.nextResetTimestampUtc || sand.next_reset_timestamp_utc);
+  const validStart = start && Number.isFinite(start.getTime()) ? start : null;
+  const validEnd = end && Number.isFinite(end.getTime()) ? end : null;
+  return {
+    id: 'grok',
+    label: 'Grok Bot',
+    detail: 'Separate weekly Grok Bot allowance',
+    used,
+    start: validStart,
+    end: validEnd,
+    cycleId: cycleKey(validStart, validEnd),
+  };
+}
+function withGrokPool(normalized, sand) {
+  if (!normalized) return null;
+  const grok = normalizeSand(sand);
+  if (!grok) return normalized;
+  const pools = Array.isArray(normalized.pools) && normalized.pools.length
+    ? normalized.pools.map(pool => ({ ...pool }))
+    : (Number.isFinite(normalized.used)
+      ? [{ id: 'included', label: 'Included usage', detail: '', used: normalized.used }]
+      : []);
+  if (!pools.some(pool => pool.id === 'grok')) pools.push(grok);
+  return { ...normalized, pools, grokPercent: grok.used, grokEnd: grok.end, grokStart: grok.start };
+}
 function settledMessage(result) {
   if (!result || result.status !== 'rejected') return '';
   return result.reason && result.reason.message ? String(result.reason.message) : 'unknown error';
@@ -684,7 +718,7 @@ async function fetchCursorData() {
     'Connect-Protocol-Version': '1',
     'x-cursor-client-type': 'ide',
   };
-  const [periodResult, summaryCookieResult, summaryBearerResult, currentResult, authUsageResult, legacyResult, planResult] = await Promise.allSettled([
+  const [periodResult, summaryCookieResult, summaryBearerResult, currentResult, authUsageResult, legacyResult, planResult, sandDashResult, sandConnectResult] = await Promise.allSettled([
     requestJson(PERIOD_URL, { method: 'POST', headers: dash, body: {} }),
     requestJson(SUMMARY_URL, { headers: dash }),
     requestJson(SUMMARY_URL, { headers: { Authorization: `Bearer ${token}`, 'x-cursor-client-type': 'ide' } }),
@@ -692,6 +726,8 @@ async function fetchCursorData() {
     requestJson(AUTH_USAGE_URL, { headers: { Authorization: `Bearer ${token}`, 'x-cursor-client-type': 'ide' } }),
     requestJson(`${LEGACY_URL}?user=${encodeURIComponent(userId)}`, { headers: { Cookie: cookie } }),
     requestJson(PLAN_URL, { headers: dash }),
+    requestJson(SAND_URL, { method: 'POST', headers: dash, body: {} }),
+    requestJson(SAND_CONNECT_URL, { method: 'POST', headers: connectHeaders, body: {} }),
   ]);
   const period = periodResult.status === 'fulfilled' ? periodResult.value : null;
   const summary = summaryCookieResult.status === 'fulfilled'
@@ -704,6 +740,9 @@ async function fetchCursorData() {
     ? legacyResult.value
     : (authUsageResult.status === 'fulfilled' ? authUsageResult.value : null);
   const plan = (planResult.status === 'fulfilled' ? planResult.value : null) || planFromSummary(summary);
+  const sand = sandDashResult.status === 'fulfilled'
+    ? sandDashResult.value
+    : (sandConnectResult.status === 'fulfilled' ? sandConnectResult.value : null);
   if (periodResult.status === 'rejected') log(`Dashboard period usage unavailable: ${settledMessage(periodResult)}`);
   if (summaryCookieResult.status === 'rejected') log(`Usage summary (cookie) unavailable: ${settledMessage(summaryCookieResult)}`);
   if (summaryBearerResult.status === 'rejected') log(`Usage summary (bearer) unavailable: ${settledMessage(summaryBearerResult)}`);
@@ -711,7 +750,9 @@ async function fetchCursorData() {
   if (authUsageResult.status === 'rejected') log(`Auth usage endpoint unavailable: ${settledMessage(authUsageResult)}`);
   if (legacyResult.status === 'rejected') log(`Legacy usage endpoint unavailable: ${settledMessage(legacyResult)}`);
   if (planResult.status === 'rejected') log(`Plan metadata endpoint unavailable: ${settledMessage(planResult)}`);
-  const normalized = normalizeUsage(current, legacy, plan);
+  if (sandDashResult.status === 'rejected') log(`Grok Bot (dashboard) unavailable: ${settledMessage(sandDashResult)}`);
+  if (sandConnectResult.status === 'rejected') log(`Grok Bot (connect) unavailable: ${settledMessage(sandConnectResult)}`);
+  let normalized = withGrokPool(normalizeUsage(current, legacy, plan), sand);
   if (!normalized) {
     const allFailed = periodResult.status === 'rejected'
       && summaryCookieResult.status === 'rejected'
@@ -727,6 +768,7 @@ async function fetchCursorData() {
     }
     throw new Error('Cursor returned data, but no supported usage allowance could be identified for this plan.');
   }
+  if (normalized.grokPercent != null) log(`Grok Bot usage ${fmtUsed(normalized.grokPercent)}; weekly reset ${normalized.grokEnd ? normalized.grokEnd.toISOString() : 'unknown'}.`);
   const team = await resolveNamespace(cookie, csrf, plan);
   const history = await loadUsageHistory(cookie, csrf, team.teamId, normalized.start, normalized.end);
   return {
@@ -893,16 +935,35 @@ function snapshotPools(snapshot) {
   if (Number.isFinite(snapshot.used)) return [{ id: 'included', label: 'Included usage', detail: '', used: snapshot.used }];
   return [];
 }
+function poolResetEnd(pool, snapshot) {
+  if (pool && pool.end instanceof Date && Number.isFinite(pool.end.getTime())) return pool.end;
+  const parsed = pool ? parseDate(pool.end) : null;
+  if (parsed && Number.isFinite(parsed.getTime())) return parsed;
+  return snapshot && snapshot.end instanceof Date && Number.isFinite(snapshot.end.getTime()) ? snapshot.end : null;
+}
+function poolCycleId(pool, snapshot) {
+  if (pool && typeof pool.cycleId === 'string' && pool.cycleId) return pool.cycleId;
+  const end = poolResetEnd(pool, snapshot);
+  const start = pool && pool.start instanceof Date && Number.isFinite(pool.start.getTime())
+    ? pool.start
+    : (pool ? parseDate(pool.start) : null);
+  if (pool && pool.id === 'grok') return cycleKey(start, end);
+  return snapshot && snapshot.cycleId ? snapshot.cycleId : cycleKey(snapshot && snapshot.start, end);
+}
 function getDailyState(snapshot) {
   const now = new Date();
-  const daysLeft = daysUntilReset(snapshot.end, now);
   const pools = snapshotPools(snapshot);
-  if (daysLeft === null || daysLeft < 1 || !pools.length) return { daysLeft: daysLeft || null, tracking: false, pools: [], over: false, warning: false };
+  if (!pools.length) return { daysLeft: null, tracking: false, pools: [], over: false, warning: false };
   const date = todayKey(now);
   const all = contextRef.globalState.get(STORAGE_KEY, {});
   let changed = false;
-  const rows = pools.map(pool => {
-    const key = `${snapshot.cycleId}|${date}|${pool.id}`;
+  const rows = [];
+  for (const pool of pools) {
+    const end = poolResetEnd(pool, snapshot);
+    const daysLeft = daysUntilReset(end, now);
+    if (daysLeft === null || daysLeft < 1) continue;
+    const cycleId = poolCycleId(pool, snapshot);
+    const key = `${cycleId}|${date}|${pool.id}`;
     let baseline = all[key];
     const remainingNow = Math.max(0, 100 - pool.used);
     const dailyBudget = remainingNow / daysLeft;
@@ -918,13 +979,16 @@ function getDailyState(snapshot) {
       changed = true;
     }
     const meterToday = Math.max(0, pool.used - baseline.startingUsed);
-    const eventToday = todayEventPercent(snapshot, pool);
+    // Event history is for Cursor plan usage only; Grok Bot is meter-baseline only.
+    const eventToday = pool.id === 'grok' ? null : todayEventPercent(snapshot, pool);
     const usedToday = eventToday === null ? meterToday : eventToday;
     const dailyRemaining = dailyBudget - usedToday;
     const usedPct = dailyBudget > 0 ? usedToday / dailyBudget * 100 : (usedToday > 0 ? 100 : 0);
     const slack = 0.05;
-    return {
+    rows.push({
       ...pool,
+      end,
+      daysLeft,
       remainingNow,
       usedToday,
       dailyBudget,
@@ -933,16 +997,20 @@ function getDailyState(snapshot) {
       baselineAt: baseline.baselineAt,
       over: usedToday > dailyBudget + slack,
       warning: usedPct >= warningThreshold() && usedToday <= dailyBudget + slack,
-    };
-  });
+    });
+  }
   if (changed) {
     const keys = Object.keys(all).sort((a, b) => String(all[b].date || '').localeCompare(String(all[a].date || '')));
-    for (const k of keys.slice(45)) delete all[k];
+    for (const k of keys.slice(80)) delete all[k];
     void contextRef.globalState.update(STORAGE_KEY, all);
     log(`Created today's balance snapshot (${date}); the baseline is held locally.`);
   }
+  if (!rows.length) {
+    return { daysLeft: daysUntilReset(snapshot.end, now), tracking: false, pools: [], over: false, warning: false };
+  }
+  const primary = rows.find(row => row.id === 'cursor') || rows.find(row => row.id !== 'grok') || rows[0];
   return {
-    daysLeft,
+    daysLeft: primary.daysLeft,
     tracking: true,
     pools: rows,
     over: rows.some(row => row.over),
@@ -967,9 +1035,9 @@ function updateStatusBar() {
       statusItem.backgroundColor = new vscode.ThemeColor('statusBarItem.warningBackground');
     } else {
       const icon = state.over ? '$(error)' : state.warning ? '$(warning)' : '$(check)';
-      const shortName = pool => pool.id === 'cursor' ? 'Cursor' : pool.id === 'other' ? 'Other' : pool.label;
+      const shortName = pool => pool.id === 'cursor' ? 'Cursor' : pool.id === 'other' ? 'Other' : pool.id === 'grok' ? 'Grok' : pool.label;
       statusItem.text = `${icon} Today ${state.pools.map(pool => `${shortName(pool)} ${fmtTarget(pool.usedToday, 'percent')}/${fmtTarget(pool.dailyBudget, 'percent')}`).join(' · ')}`;
-      statusItem.tooltip = state.pools.map(pool => `${pool.label}: used ${fmtTarget(pool.usedToday, 'percent')} today of ${fmtTarget(pool.dailyBudget, 'percent')} allocated. Cycle ${fmtUsed(pool.used)} used, ${fmtUsed(pool.remainingNow)} left.`).join(' ') + ` ${state.daysLeft} day(s) until reset. Click to open dashboard.`;
+      statusItem.tooltip = state.pools.map(pool => `${pool.label}: used ${fmtTarget(pool.usedToday, 'percent')} today of ${fmtTarget(pool.dailyBudget, 'percent')} allocated. Cycle ${fmtUsed(pool.used)} used, ${fmtUsed(pool.remainingNow)} left, ${pool.daysLeft} day(s) until reset.`).join(' ') + ' Click to open dashboard.';
       statusItem.backgroundColor = state.over ? new vscode.ThemeColor('statusBarItem.errorBackground') : state.warning ? new vscode.ThemeColor('statusBarItem.warningBackground') : undefined;
       if (state.over) {
         const noticeKey = `${latest.cycleId}|${todayKey()}|over`;
@@ -1037,20 +1105,22 @@ function dashboardHtml() {
     ? `${overPool.label} is over today's target by ${fmtTarget(Math.max(0, overPool.usedToday - overPool.dailyBudget), 'percent')}.`
     : warnPool
       ? `${warnPool.label} has used ${pct(warnPool.usedPct)} of today's target. ${fmtTarget(Math.max(0, warnPool.dailyRemaining), 'percent')} remains today.`
-      : `Within today's targets. Each pool's leftover percent is split across ${state.daysLeft} day(s).`;
-  const trackingStarted = new Date(state.pools[0].baselineAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+      : 'Within today\'s targets. Each pool splits leftover percent across its own days until reset.';
   const resetDate = latest.end ? latest.end.toLocaleDateString([], { year: 'numeric', month: 'short', day: 'numeric' }) : 'Unavailable';
+  const fmtPoolReset = pool => pool.end ? pool.end.toLocaleDateString([], { year: 'numeric', month: 'short', day: 'numeric' }) : resetDate;
   const poolCards = state.pools.map(pool => {
     const todayPct = clamp(pool.usedPct, 0, 100);
-    return `<div class="metric"><span>${escapeHtml(pool.label)}</span><strong>${fmtTarget(pool.usedToday, 'percent')} / ${fmtTarget(pool.dailyBudget, 'percent')}</strong><small>Used today / allocated today</small><div class="bar"><i class="${pool.over ? 'badbar' : ''}" style="width:${todayPct}%"></i></div><p class="tiny">${fmtUsed(pool.remainingNow)} left ÷ ${state.daysLeft} days = ${fmtTarget(pool.dailyBudget, 'percent')} allocated. Used today matches today's bar.</p></div>`;
+    const cadence = pool.id === 'grok' ? 'weekly' : 'billing-cycle';
+    return `<div class="metric"><span>${escapeHtml(pool.label)}</span><strong>${fmtTarget(pool.usedToday, 'percent')} / ${fmtTarget(pool.dailyBudget, 'percent')}</strong><small>Used today / allocated today</small><div class="bar"><i class="${pool.over ? 'badbar' : ''}" style="width:${todayPct}%"></i></div><p class="tiny">${fmtUsed(pool.remainingNow)} left ÷ ${pool.daysLeft} days = ${fmtTarget(pool.dailyBudget, 'percent')} allocated (${cadence}; resets ${escapeHtml(fmtPoolReset(pool))}).</p></div>`;
   }).join('');
   const history = latest.history || { days: [], models: [], todayModels: [], today: { cents: 0, tokens: 0, requests: 0 }, measure: 'requests', eventCount: 0 };
   const measure = history.measure === 'cents' ? 'cents' : 'requests';
-  const cyclePool = state.pools.find(pool => pool.id === 'cursor') || state.pools[0];
+  const cyclePool = state.pools.find(pool => pool.id === 'cursor') || state.pools.find(pool => pool.id !== 'grok') || state.pools[0];
   const cycleUsed = cyclePool ? cyclePool.used : latest.used;
   const plotted = chartDays(history, cycleUsed);
   const todayAllowance = cyclePool ? cyclePool.dailyBudget : 0;
   const percentLeft = cyclePool ? cyclePool.remainingNow : Math.max(0, 100 - cycleUsed);
+  const chartDaysLeft = cyclePool ? cyclePool.daysLeft : state.daysLeft;
   const maxScale = Math.max(todayAllowance, ...plotted.map(day => day.usedPct), 0.01);
   const todayKeyNow = todayKey();
   const chart = plotted.map(day => {
@@ -1060,39 +1130,44 @@ function dashboardHtml() {
     const usedLabel = upcoming ? `${todayAllowance.toFixed(1)}%` : `${day.usedPct.toFixed(1)}%`;
     const modelHint = Array.isArray(day.models) && day.models.length ? ` · ${day.models.join(', ')}` : '';
     const title = upcoming
-      ? `${day.day} · daily limit ${fmtTarget(todayAllowance, 'percent')} = ${fmtUsed(percentLeft)} left ÷ ${state.daysLeft} days`
-      : `${day.day} · used ${usedLabel} · today's limit is ${fmtTarget(todayAllowance, 'percent')} (${fmtUsed(percentLeft)} left ÷ ${state.daysLeft} days) · ${historyAmount(day, measure)}${modelHint}`;
+      ? `${day.day} · daily limit ${fmtTarget(todayAllowance, 'percent')} = ${fmtUsed(percentLeft)} left ÷ ${chartDaysLeft} days`
+      : `${day.day} · used ${usedLabel} · today's limit is ${fmtTarget(todayAllowance, 'percent')} (${fmtUsed(percentLeft)} left ÷ ${chartDaysLeft} days) · ${historyAmount(day, measure)}${modelHint}`;
     return `<div class="col ${day.day === todayKeyNow ? 'today' : ''}${upcoming ? ' upcoming' : ''}" title="${escapeHtml(title)}"><span class="used">${escapeHtml(usedLabel)}</span><div class="grow"><i style="height:${height}%"></i></div><span>${escapeHtml(dayLabel(day.day))}</span></div>`;
   }).join('');
   const modelRows = rows => (rows || []).map(row => `<tr><td>${escapeHtml(row.model)}</td><td class="num">${escapeHtml(String(Math.round(row.requests)))}</td><td class="num">${escapeHtml(fmtTokens(row.tokens))}</td><td class="num">${escapeHtml(money(row.cents))}</td></tr>`).join('');
   const todayModels = history.todayModels || [];
   const cycleModels = history.models || [];
   const historyNote = history.error ? `<p class="tiny">Usage history could not be loaded (${escapeHtml(history.error)}). The daily percent targets above still come from Plan & Usage.</p>` : '';
+  const grokPool = state.pools.find(pool => pool.id === 'grok');
+  const grokNote = grokPool
+    ? `<span class="muted">Grok Bot resets ${escapeHtml(fmtPoolReset(grokPool))} (${grokPool.daysLeft} day(s) left)</span>`
+    : '';
   return page(nonce, `
   <div class="hero"><div><h1>Plan & Usage</h1><p>Daily allowance, what you used, and the billing-cycle history</p></div><div class="actions"><button data-action="refresh">⟳ Refresh now</button><button class="secondary" data-action="usage">Open Usage & Plans</button></div></div>
-  <div class="subhead"><span class="plan">${escapeHtml(latest.namespace || configuredNamespace())}</span><span class="plan">${escapeHtml(latest.plan)}</span><span class="muted">Usage limits reset on ${escapeHtml(resetDate)} (${state.daysLeft} days left)</span><span class="muted">Last synced ${new Date(latest.fetchedAt).toLocaleTimeString()}</span></div>
+  <div class="subhead"><span class="plan">${escapeHtml(latest.namespace || configuredNamespace())}</span><span class="plan">${escapeHtml(latest.plan)}</span><span class="muted">Plan usage resets ${escapeHtml(resetDate)} (${state.daysLeft} days left)</span>${grokNote}<span class="muted">Last synced ${new Date(latest.fetchedAt).toLocaleTimeString()}</span></div>
   <div class="grid">
    ${poolCards}
-   <div class="metric"><span>Days left</span><strong>${escapeHtml(String(state.daysLeft))}</strong><small>Reset ${escapeHtml(resetDate)}</small><p class="tiny">The daily limit is whatever percent is still left, split across these days. It is not a fixed 30-day month.</p></div>
+   <div class="metric"><span>Plan days left</span><strong>${escapeHtml(String(state.daysLeft))}</strong><small>Reset ${escapeHtml(resetDate)}</small><p class="tiny">Cursor Models / Other Models split leftover percent across these days. Grok Bot uses its own weekly reset.</p></div>
   </div>
   <div class="alert ${statusClass}">${escapeHtml(statusText)}</div>
-  <h2>Each day this cycle</h2>
-  <p class="tiny">Past days show used percent. Today and the days still left each show ${fmtTarget(todayAllowance, 'percent')}, which is ${fmtUsed(percentLeft)} left divided by ${state.daysLeft} days.</p>
+  <h2>Each day this plan cycle</h2>
+  <p class="tiny">Past days show used percent for Cursor Models. Today and the days still left each show ${fmtTarget(todayAllowance, 'percent')}, which is ${fmtUsed(percentLeft)} left divided by ${chartDaysLeft} days. Grok Bot is tracked separately above.</p>
   ${historyNote}
   <div class="chart">${chart || '<p class="tiny">No daily history yet.</p>'}</div>
-  <h2>Monthly limit</h2>
-  <p class="tiny">Each pool's cap for this billing cycle is 100%. The number is what you have used of that monthly limit.</p>
+  <h2>Pool limits</h2>
+  <p class="tiny">Each pool's cap is 100%. Cursor Models and Other Models follow the billing cycle; Grok Bot follows its weekly window.</p>
   <div class="grid">
    ${state.pools.map(pool => {
     const monthUsed = clamp(pool.used, 0, 100);
-    return `<div class="metric"><span>${escapeHtml(pool.label)}</span><strong>${fmtUsed(pool.used)} / 100%</strong><small>Used this cycle / monthly limit</small><div class="bar"><i class="${monthUsed >= 100 ? 'badbar' : ''}" style="width:${monthUsed}%"></i></div><p class="tiny">${fmtUsed(pool.remainingNow)} left. Resets ${escapeHtml(resetDate)}.</p></div>`;
+    const limitLabel = pool.id === 'grok' ? 'Used this week / weekly limit' : 'Used this cycle / monthly limit';
+    return `<div class="metric"><span>${escapeHtml(pool.label)}</span><strong>${fmtUsed(pool.used)} / 100%</strong><small>${escapeHtml(limitLabel)}</small><div class="bar"><i class="${monthUsed >= 100 ? 'badbar' : ''}" style="width:${monthUsed}%"></i></div><p class="tiny">${fmtUsed(pool.remainingNow)} left. Resets ${escapeHtml(fmtPoolReset(pool))} (${pool.daysLeft} day(s)).</p></div>`;
   }).join('')}
   </div>
   <h2>What you used today</h2>
   ${todayModels.length ? `<table class="usage"><thead><tr><th>Model</th><th class="num">Requests</th><th class="num">Tokens</th><th class="num">Charged</th></tr></thead><tbody>${modelRows(todayModels)}</tbody></table>` : '<p class="tiny">No usage events for today yet.</p>'}
   <h2>What you used this cycle</h2>
   ${cycleModels.length ? `<table class="usage"><thead><tr><th>Model</th><th class="num">Requests</th><th class="num">Tokens</th><th class="num">Charged</th></tr></thead><tbody>${modelRows(cycleModels.slice(0, 20))}</tbody></table>` : '<p class="tiny">No usage events in this billing cycle yet.</p>'}
-  <div class="footnote"><b>Daily limit</b> = percent still left ÷ days still left. With 50% left and 20 days left, each day is 2.50%. The split updates from the live meter and the real reset date.</div>
+  <div class="footnote"><b>Daily limit</b> = percent still left ÷ days still left for that pool. Grok Bot is a separate weekly meter from Plan & Usage.</div>
   `);
 }
 function page(nonce, body) {
@@ -1148,4 +1223,4 @@ function activate(context) {
   log('Cursor Daily Credits started. No manual data entry is required.');
 }
 function deactivate() { if (timer) clearInterval(timer); }
-module.exports = { activate, deactivate, normalizeUsage, daysUntilReset, summarizeHistory };
+module.exports = { activate, deactivate, normalizeUsage, normalizeSand, daysUntilReset, summarizeHistory };
